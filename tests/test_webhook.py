@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 os.environ["ALICE_SKILL_ID"] = "test-skill-id"
 os.environ["ALICE_WEBHOOK_TOKEN"] = "test-only-token"
-os.environ["OPENAI_API_KEY"] = "test-only-key"
+os.environ["ANTHROPIC_API_KEY"] = "test-only-key"
 
 from api import index  # noqa: E402
 
@@ -47,13 +47,14 @@ class WebhookTests(unittest.TestCase):
         self.assertEqual(status, 403)
 
     def test_valid_request_returns_alice_format(self):
-        fake = {"id": "resp_example", "status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": "Здравствуйте!"}]}]}
+        fake = {"id": "msg_example", "content": [{"type": "text", "text": "Здравствуйте!"}]}
         with patch.object(index, "_api_request", return_value=fake):
             status, data = self.send("test-only-token", "test-skill-id")
         self.assertEqual(status, 200)
         self.assertEqual(data["version"], "1.0")
         self.assertEqual(data["response"]["text"], "Здравствуйте!")
-        self.assertEqual(data["session_state"]["previous_response_id"], "resp_example")
+        self.assertEqual(data["session_state"]["last_question"], "Привет")
+        self.assertEqual(data["session_state"]["last_answer"], "Здравствуйте!")
 
     def test_search_is_explicit(self):
         self.assertTrue(index._needs_web_search("поищи в интернете новости"))

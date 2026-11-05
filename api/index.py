@@ -8,16 +8,16 @@ import json
 import logging
 import os
 import re
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 
-API_URL = "https://api.openai.com/v1/responses"
-MODEL = os.environ.get("OPENAI_MODEL", "gpt-6-luna")
+API_URL = "https://api.anthropic.com/v1/messages"
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
 MAX_ANSWER_CHARS = 900  # Лимит поля response.text у Алисы: 1024.
-OPENAI_TIME_BUDGET_SECONDS = 3.6  # У Яндекс Диалогов всего 4,5 с, включая сеть.
+CLAUDE_TIMEOUT_SECONDS = 3.6  # У Яндекс Диалогов всего 4,5 с, включая сеть.
+MAX_CONTEXT_BYTES = 850  # session_state Яндекс Диалогов ограничен 1 КБ.
 
 INSTRUCTIONS = (
     "Ты голосовой помощник в приватном навыке Алисы. Отвечай на русском языке "
@@ -28,27 +28,31 @@ INSTRUCTIONS = (
     "действие во внешнем сервисе, если оно не было выполнено."
 )
 SEARCH_PROMPT = (
-    "Для этого вопроса используй веб-поиск. Ответь на русском кратко, "
+    "Для этого вопроса обязательно используй доступный веб-поиск. Ответь на русском кратко, "
     "только по найденным данным. Назови источник обычными словами. "
     "Не произноси адреса сайтов. Если подтверждения нет, скажи об этом."
 )
-SEARCH_FOLLOWUP = ("что нашлось", "что нашёл", "ну что нашёл", "ну что нашлось")
 
 
-class OpenAIError(Exception):
-    """Ошибка обращения к OpenAI API."""
+class ClaudeError(Exception):
+    """Ошибка обращения к Claude API."""
 
 
-def _api_request(method, url, key, payload=None, timeout=2.5):
+def _api_request(key, payload, timeout=CLAUDE_TIMEOUT_SECONDS):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload else None
+    headers = {
+        "Authorization": "Bearer " + key,
+        "anthropic-version": "2026-10-21",
+        "Content-Type": "application/json",
+    }
+    workspace_id = os.environ.get("ANTHROPIC_WORKSPACE_ID", "").strip()
+    if workspace_id:
+        headers["anthropic-workspace-id"] = workspace_id
     req = urllib.request.Request(
-        url,
+        API_URL,
         data=body,
-        method=method,
-        headers={
-            "Authorization": "Bearer " + key,
-            "Content-Type": "application/json",
-        },
+        method="POST",
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as res:
@@ -58,23 +62,23 @@ def _api_request(method, url, key, payload=None, timeout=2.5):
             detail = json.loads(exc.read().decode("utf-8"))
             error = detail.get("error", {})
             logging.warning(
-                "OpenAI API HTTP %s: %s — %s",
+                "Claude API HTTP %s: %s — %s",
                 exc.code,
                 str(error.get("code") or error.get("type") or "unknown")[:80],
                 str(error.get("message") or "")[:300],
             )
         except (OSError, ValueError, AttributeError):
-            logging.warning("OpenAI API HTTP %s", exc.code)
+            logging.warning("Claude API HTTP %s", exc.code)
         if exc.code == 401:
-            raise OpenAIError("Ключ OpenAI API не принят.") from exc
+            raise ClaudeError("Ключ Claude API не принят.") from exc
+        if exc.code == 400:
+            raise ClaudeError("Запрос к Claude API отклонён. Проверьте модель и настройки.") from exc
         if exc.code == 429:
-            raise OpenAIError("Сейчас достигнут лимит OpenAI API.") from exc
-        if exc.code == 404:
-            raise OpenAIError("Предыдущий ответ больше недоступен.") from exc
-        raise OpenAIError("Сервис ответов временно недоступен.") from exc
+            raise ClaudeError("Сейчас достигнут лимит Claude API.") from exc
+        raise ClaudeError("Сервис ответов временно недоступен.") from exc
     except (OSError, ValueError) as exc:
-        logging.warning("OpenAI API request failed: %s", type(exc).__name__)
-        raise OpenAIError("Не удалось связаться с сервисом ответов.") from exc
+        logging.warning("Claude API request failed: %s", type(exc).__name__)
+        raise ClaudeError("Не удалось связаться с сервисом ответов.") from exc
 
 
 def _needs_web_search(command):
@@ -89,12 +93,9 @@ def _needs_web_search(command):
 
 def _answer_text(data):
     parts = []
-    for item in data.get("output", []):
-        if item.get("type") != "message":
-            continue
-        for part in item.get("content", []):
-            if part.get("type") == "output_text" and isinstance(part.get("text"), str):
-                parts.append(part["text"])
+    for part in data.get("content", []):
+        if part.get("type") == "text" and isinstance(part.get("text"), str):
+            parts.append(part["text"])
     text = " ".join(parts)
     text = re.sub(r"【[^】]{1,160}】|\ue200cite\ue202.*?\ue201", "", text)
     text = re.sub(r"\[([^]]+)\]\(https?://[^)]+\)", r"\1", text)
@@ -111,23 +112,19 @@ def _answer_text(data):
 def _source_buttons(data):
     buttons = []
     seen = set()
-    for item in data.get("output", []):
-        if item.get("type") != "message":
+    for part in data.get("content", []):
+        if part.get("type") != "text":
             continue
-        for part in item.get("content", []):
-            for annotation in part.get("annotations", []):
-                if annotation.get("type") != "url_citation":
-                    continue
-                citation = annotation.get("url_citation") or annotation
-                url = citation.get("url", "")
-                title = " ".join(str(citation.get("title") or "Источник").split())
-                parsed = urllib.parse.urlsplit(url)
-                if parsed.scheme != "https" or not parsed.netloc or len(url.encode("utf-8")) > 1024 or url in seen:
-                    continue
-                seen.add(url)
-                buttons.append({"title": ("Источник: " + title)[:64], "url": url, "hide": True})
-                if len(buttons) == 3:
-                    return buttons
+        for citation in part.get("citations", []):
+            url = citation.get("url", "")
+            title = " ".join(str(citation.get("title") or "Источник").split())
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme != "https" or not parsed.netloc or len(url.encode("utf-8")) > 1024 or url in seen:
+                continue
+            seen.add(url)
+            buttons.append({"title": ("Источник: " + title)[:64], "url": url, "hide": True})
+            if len(buttons) == 3:
+                return buttons
     return buttons
 
 
@@ -141,9 +138,22 @@ def _say(text, state=None, end_session=False):
     return result
 
 
-def _finish(data):
+def _conversation_state(question, answer):
+    """Хранит короткий контекст, не превышая лимит session_state Яндекса."""
+    state = {"last_question": question[:280], "last_answer": answer[:360]}
+    while len(json.dumps(state, ensure_ascii=False).encode("utf-8")) > MAX_CONTEXT_BYTES:
+        if len(state["last_answer"]) > 80:
+            state["last_answer"] = state["last_answer"][:-40]
+        elif len(state["last_question"]) > 80:
+            state["last_question"] = state["last_question"][:-40]
+        else:
+            return {}
+    return state
+
+
+def _finish(data, question):
     answer = _answer_text(data)
-    result = _say(answer, {"previous_response_id": data["id"]})
+    result = _say(answer, _conversation_state(question, answer))
     buttons = _source_buttons(data)
     if buttons:
         result["response"]["buttons"] = buttons
@@ -153,7 +163,6 @@ def _finish(data):
 def handler_alice(event, context):
     """Обработчик события Яндекс Диалогов."""
     del context
-    start = time.monotonic()
     if not isinstance(event, dict):
         return _say("Не удалось прочитать запрос. Повторите, пожалуйста.")
 
@@ -163,10 +172,6 @@ def handler_alice(event, context):
     state = (event.get("state") or {}).get("session") or {}
     if not isinstance(state, dict):
         state = {}
-    previous_id = state.get("previous_response_id", "")
-    if not isinstance(previous_id, str) or not previous_id.startswith("resp_"):
-        previous_id = ""
-
     if command in ("хватит", "выход", "закончить", "стоп"):
         return _say("До встречи!", end_session=True)
     if command in ("сброс", "забудь разговор", "начать заново"):
@@ -178,84 +183,35 @@ def handler_alice(event, context):
             state,
         )
 
-    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not key:
-        return _say("В навыке ещё не настроен ключ OpenAI API.")
+        return _say("В навыке ещё не настроен ключ Claude API.")
 
-    pending = state.get("pending_response_id", "")
-    if pending:
-        is_search = bool(state.get("pending_search"))
-        waiting_text = (
-            "Ещё ищу. Спросите «что нашлось?» через несколько секунд."
-            if is_search else "Ещё думаю. Скажите «готово» через несколько секунд."
-        )
-        response_id = pending
-        if not isinstance(response_id, str) or not response_id.startswith("resp_"):
-            return _say("Не удалось продолжить ответ. Повторите вопрос.", {})
-        url = API_URL + "/" + urllib.parse.quote(response_id, safe="")
-        try:
-            data = _api_request("GET", url, key, timeout=2.4)
-        except OpenAIError as exc:
-            if "больше недоступен" in str(exc):
-                return _say(str(exc) + " Повторите вопрос.", {})
-            return _say(str(exc) + " " + waiting_text, state)
-        if data.get("status") == "completed":
-            answer = _finish(data)
-            if command not in ("", "готово", "ответ", "дальше", "ну что", *SEARCH_FOLLOWUP):
-                answer["response"]["text"] += " Повторите ваш новый вопрос."
-            return answer
-        if data.get("status") in ("queued", "in_progress"):
-            return _say(waiting_text, state)
-        return _say("Получить ответ не удалось. Повторите вопрос.", {})
-
-    if not utterance or command in ("готово", "ответ", "дальше", *SEARCH_FOLLOWUP):
+    if not utterance:
         return _say("Здравствуйте! Задайте вопрос, и я постараюсь ответить.", state)
 
     question = utterance[:1000]
     search = _needs_web_search(command)
+    context = ""
+    previous_question = state.get("last_question")
+    previous_answer = state.get("last_answer")
+    if isinstance(previous_question, str) and isinstance(previous_answer, str):
+        context = (
+            "Контекст предыдущего обмена (он может быть сокращён):\n"
+            f"Пользователь: {previous_question}\nПомощник: {previous_answer}\n\n"
+        )
     payload = {
         "model": MODEL,
-        "instructions": INSTRUCTIONS + (" " + SEARCH_PROMPT if search else ""),
-        "input": [{"role": "user", "content": question}],
-        "reasoning": {"effort": "none"},
-        "max_output_tokens": 220 if search else 120,
-        "background": search,
-        "store": True,
+        "system": INSTRUCTIONS + (" " + SEARCH_PROMPT if search else ""),
+        "messages": [{"role": "user", "content": context + question}],
+        "max_tokens": 220 if search else 120,
     }
     if search:
-        payload["tools"] = [{"type": "web_search", "search_context_size": "low"}]
-        payload["tool_choice"] = "required"
-    if previous_id:
-        payload["previous_response_id"] = previous_id
+        payload["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}]
     try:
-        data = _api_request("POST", API_URL, key, payload=payload, timeout=2.4 if search else 3.6)
-        if data.get("status") == "completed":
-            return _finish(data)
-        response_id = data.get("id", "")
-        if data.get("status") not in ("queued", "in_progress") or not response_id:
-            return _say("Получить ответ не удалось. Повторите вопрос.", state)
-
-        # Пока есть время, проверяем готовность без выхода за лимит Алисы.
-        url = API_URL + "/" + urllib.parse.quote(response_id, safe="")
-        while (remaining := OPENAI_TIME_BUDGET_SECONDS - (time.monotonic() - start)) > 0.65:
-            try:
-                ready = _api_request("GET", url, key, timeout=min(remaining - 0.25, 0.8))
-                if ready.get("status") == "completed":
-                    return _finish(ready)
-                if ready.get("status") not in ("queued", "in_progress"):
-                    break
-            except OpenAIError:
-                break
-            if (remaining := OPENAI_TIME_BUDGET_SECONDS - (time.monotonic() - start)) > 0.9:
-                time.sleep(min(0.2, remaining - 0.7))
-        return _say(
-            "Ищу информацию. Спросите «что нашлось?» через несколько секунд."
-            if search else "Думаю над ответом. Скажите «готово» через несколько секунд.",
-            {"pending_response_id": response_id, "pending_search": search},
-        )
-    except OpenAIError as exc:
-        if "больше недоступен" in str(exc):
-            return _say("Контекст беседы устарел. Скажите «сброс» и повторите вопрос.", state)
+        data = _api_request(key, payload, timeout=CLAUDE_TIMEOUT_SECONDS)
+        return _finish(data, question)
+    except ClaudeError as exc:
         return _say(str(exc) + " Повторите вопрос позже.", state)
 
 
